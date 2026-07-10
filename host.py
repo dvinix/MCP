@@ -11,6 +11,8 @@ from groq import AsyncGroq
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
+from check_commitments import generate_nudge_text
+
 load_dotenv()
 
 # ---------------------------------------------------------------------------
@@ -100,18 +102,48 @@ LOCAL_TOOL_DEFS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_nudges",
+            "description": "Show overdue and upcoming deadlines for open commitments, grouped by person.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+            },
+        },
+    },
 ]
 
+
+def _fuzzy_person_id(raw: str) -> str | None:
+    """Try fuzzy match of a raw name to a known person key."""
+    import difflib
+    raw_norm = raw.lower().replace(" ", "").replace("-", "")
+    known = {pid: label.lower().replace(" ", "").replace("-", "") for pid, label in PERSON_LABELS.items()}
+    # exact match
+    for pid, norm in known.items():
+        if raw_norm == norm:
+            return pid
+    # substring match
+    for pid, norm in known.items():
+        if raw_norm in norm or norm in raw_norm:
+            return pid
+    # fuzzy (levenshtein-ish) match
+    matches = difflib.get_close_matches(raw_norm, list(known.values()), n=1, cutoff=0.6)
+    if matches:
+        for pid, norm in known.items():
+            if norm == matches[0]:
+                return pid
+    return None
 
 def handle_local_tool(name: str, args: dict, commitments: list[Commitment], active_person: str, active_label: str) -> str:
     """Execute a local tool and return text result."""
     if name == "record_commitment":
         person_arg = args.get("person", active_label)
-        # Map back to person key if a label was used
-        for pid, label in PERSON_LABELS.items():
-            if person_arg.lower() == label.lower():
-                person_arg = pid
-                break
+        # Map back to person key using fuzzy matching; fall back to active speaker
+        mapped = _fuzzy_person_id(person_arg)
+        person_arg = mapped if mapped else active_person
         commitment = Commitment(
             person=person_arg,
             task=args.get("task", ""),
@@ -141,6 +173,9 @@ def handle_local_tool(name: str, args: dict, commitments: list[Commitment], acti
         if not results:
             return "No open commitments found."
         return "\n".join(results)
+
+    if name == "get_nudges":
+        return generate_nudge_text(commitments)
 
     return f"Error: unknown local tool '{name}'"
 
@@ -304,6 +339,22 @@ async def main():
         open_count = sum(1 for c in commitments if c.status == "open")
         safe_print(f"\nMCP Host ready  |  {server_count} server(s)  |  {len(groq_tools)} tool(s)")
         safe_print(f"Active: {active_label}  |  Open commitments: {open_count}")
+
+        # --- nudge summary ---
+        nudge_text = generate_nudge_text(commitments, timezone)
+        if nudge_text.strip():
+            lines = nudge_text.split("\n")
+            overdue = sum(1 for l in lines if "OVERDUE:" in l)
+            due_today = sum(1 for l in lines if "DUE TODAY:" in l)
+            due_soon = sum(1 for l in lines if "DUE SOON:" in l)
+            parts = []
+            if overdue:
+                parts.append(f"{overdue} overdue")
+            if due_today:
+                parts.append(f"{due_today} due today")
+            if due_soon:
+                parts.append(f"{due_soon} due soon")
+            safe_print(f"Nudges: {', '.join(parts)}")
         safe_print("Type a message, or 'exit' / 'quit' to stop.\n")
 
         # --- build calendar map context ---
@@ -332,10 +383,14 @@ async def main():
             "When the user says something that sounds like a commitment, promise, or task "
             "they'll handle (e.g. \"I'll handle...\", \"I've got...\", \"I'll deal with...\", "
             "\"someone needs to...\", \"I'll take care of...\", \"I'll do...\", "
-            "\"I'll call...\", \"I'll pick up...\", \"I'll schedule...\"), "
+            "\"I'll call...\", \"I'll pick up...\", \"I'll schedule...\", "
+            "\"I got <something> covered\", \"I need to <do something>\"), "
             "call the record_commitment tool to save it.\n"
-            "Extract the task description, who is responsible (defaults to the active speaker), "
-            "and any deadline mentioned (like 'this week', 'Thursday', 'by tomorrow').\n"
+            "Extract the task description. The person responsible ALWAYS defaults to the "
+            "active speaker — do NOT invent or guess any other name. "
+            "Extract any deadline mentioned: day names (Monday/Tuesday/etc.), "
+            "relative dates (\"this week\", \"by Friday\", \"tomorrow\", \"this weekend\"), "
+            "or specific dates.\n"
             "Capture the original sentence as source_text.\n"
             "Do NOT ask the user to confirm — just silently record it and mention it in your reply."
         )
