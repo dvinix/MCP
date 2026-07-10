@@ -1,0 +1,27 @@
+{
+  "servers": {
+    "filesystem": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "./data"],
+      "owner": "person_1"
+    },
+    "filesystem-person2": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "./data-person2"],
+      "owner": "person_2"
+    },
+    "calendar": {
+      "command": "npx",
+      "args": ["-y", "mcp-google-calendar"],
+      "env": {
+        "CREDENTIALS_PATH": "./credentials.json"
+      },
+      "owner": "shared"
+    }
+  },
+  "calendar_map": {
+    "person_1": "2023pietcadivyanshu018@poornima.org",
+    "person_2": "gargdivyanshu4152@gmail.com"
+  },
+  "timezone": "Asia/Kolkata"
+}
