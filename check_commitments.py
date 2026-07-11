@@ -6,43 +6,10 @@ a grouped urgency report (overdue / due today / due soon).
 Can be run standalone or imported by host.py.
 """
 
-import json
 import sys
-from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 
-# ---------------------------------------------------------------------------
-# Shared data model (mirrored from host.py for standalone safety)
-# ---------------------------------------------------------------------------
-
-COMMITMENTS_FILE = "commitments.json"
-PERSON_LABELS = {"person_1": "Divyanshu Garg", "person_2": "dvinix"}
-
-
-@dataclass
-class Commitment:
-    person: str
-    task: str
-    source_text: str
-    deadline: str | None
-    status: str
-    created_at: float = 0.0
-
-
-def load_commitments() -> list[Commitment]:
-    try:
-        with open(COMMITMENTS_FILE) as f:
-            data = json.load(f)
-            return [Commitment(**c) for c in data]
-    except (FileNotFoundError, json.JSONDecodeError):
-        return []
-
-
-def safe_print(*args, **kwargs):
-    enc = sys.stdout.encoding or "utf-8"
-    text = " ".join(str(a) for a in args)
-    kwargs.pop("file", None)
-    print(text.encode(enc, errors="replace").decode(enc), **kwargs)
+from common import Commitment, PERSON_LABELS, COMMITMENTS_FILE, safe_print, load_commitments
 
 
 # ---------------------------------------------------------------------------
