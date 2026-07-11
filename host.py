@@ -13,49 +13,15 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
 from check_commitments import generate_nudge_text
-from shopping_list import ShoppingItem, load_shopping_list, save_shopping_list, fuzzy_dedup
+from shopping_list import fuzzy_dedup
+from common import (
+    Commitment, ShoppingItem, AppState, PERSON_LABELS,
+    load_commitments, save_commitments, load_shopping_list, save_shopping_list,
+    safe_print, fuzzy_person_id
+)
+
 
 load_dotenv()
-
-# ---------------------------------------------------------------------------
-# Safe print for Windows terminals
-# ---------------------------------------------------------------------------
-
-def safe_print(*args, **kwargs):
-    enc = sys.stdout.encoding or "utf-8"
-    text = " ".join(str(a) for a in args)
-    kwargs.pop("file", None)
-    print(text.encode(enc, errors="replace").decode(enc), **kwargs)
-
-
-# ---------------------------------------------------------------------------
-# Commitment data model + persistence
-# ---------------------------------------------------------------------------
-
-COMMITMENTS_FILE = "commitments.json"
-
-@dataclass
-class Commitment:
-    person: str
-    task: str
-    source_text: str
-    deadline: str | None
-    status: str  # "open" | "done"
-    created_at: float = field(default_factory=time.time)
-
-
-def load_commitments() -> list[Commitment]:
-    try:
-        with open(COMMITMENTS_FILE) as f:
-            data = json.load(f)
-            return [Commitment(**c) for c in data]
-    except (FileNotFoundError, json.JSONDecodeError):
-        return []
-
-
-def save_commitments(commitments: list[Commitment]) -> None:
-    with open(COMMITMENTS_FILE, "w") as f:
-        json.dump([asdict(c) for c in commitments], f, indent=2)
 
 
 # ---------------------------------------------------------------------------
@@ -172,33 +138,17 @@ LOCAL_TOOL_DEFS = [
 ]
 
 
-def _fuzzy_person_id(raw: str) -> str | None:
-    """Try fuzzy match of a raw name to a known person key."""
-    import difflib
-    raw_norm = raw.lower().replace(" ", "").replace("-", "")
-    known = {pid: label.lower().replace(" ", "").replace("-", "") for pid, label in PERSON_LABELS.items()}
-    # exact match
-    for pid, norm in known.items():
-        if raw_norm == norm:
-            return pid
-    # substring match
-    for pid, norm in known.items():
-        if raw_norm in norm or norm in raw_norm:
-            return pid
-    # fuzzy (levenshtein-ish) match
-    matches = difflib.get_close_matches(raw_norm, list(known.values()), n=1, cutoff=0.6)
-    if matches:
-        for pid, norm in known.items():
-            if norm == matches[0]:
-                return pid
-    return None
-
-def handle_local_tool(name: str, args: dict, commitments: list[Commitment], shopping_items: list[ShoppingItem], active_person: str, active_label: str) -> str:
+def handle_local_tool(name: str, args: dict, app_state: AppState) -> str:
     """Execute a local tool and return text result."""
+    commitments = app_state.commitments
+    shopping_items = app_state.shopping_items
+    active_person = app_state.active_person
+    active_label = app_state.active_label
+    
     if name == "record_commitment":
         person_arg = args.get("person", active_label)
         # Map back to person key using fuzzy matching; fall back to active speaker
-        mapped = _fuzzy_person_id(person_arg)
+        mapped = fuzzy_person_id(person_arg)
         person_arg = mapped if mapped else active_person
         commitment = Commitment(
             person=person_arg,
@@ -382,7 +332,6 @@ def is_write_tool(tool_name: str) -> bool:
 # Person/identity helpers
 # ---------------------------------------------------------------------------
 
-PERSON_LABELS = {"person_1": "Divyanshu Garg", "person_2": "dvinix"}
 
 def select_person() -> str:
     safe_print("\nWho is speaking?")
@@ -398,6 +347,184 @@ def select_person() -> str:
 # Main
 # ---------------------------------------------------------------------------
 
+
+async def setup_servers(config, server_owners, stack):
+    sessions = {}
+    tool_owner = {}
+    tool_original = {}
+    mcp_tools = []
+    server_count = 0
+    
+    for name, cfg in config["servers"].items():
+        owner = server_owners.get(name, "unknown")
+        safe_print(f"Starting MCP server: {name}  (owner: {owner}) ...")
+
+        server_env = cfg.get("env")
+        merged_env = {**os.environ, **server_env} if server_env else None
+
+        server_params = StdioServerParameters(
+            command=cfg["command"],
+            args=cfg.get("args", []),
+            env=merged_env,
+        )
+
+        try:
+            streams = await stack.enter_async_context(stdio_client(server_params))
+            session = await stack.enter_async_context(ClientSession(streams[0], streams[1]))
+            await session.initialize()
+        except Exception as exc:
+            safe_print(f"  -> FAILED to start: {exc}")
+            continue
+
+        sessions[name] = session
+        server_count += 1
+
+        result = await session.list_tools()
+        for tool in result.tools:
+            ns = namespaced_name(name, tool.name)
+            tool_owner[ns] = name
+            tool_original[ns] = tool.name
+
+        mcp_tools.extend(mcp_tool_to_openai(name, t, owner) for t in result.tools)
+
+        safe_print(f"  -> {len(result.tools)} tool(s) registered")
+        
+    return sessions, tool_owner, tool_original, mcp_tools, server_count
+
+def build_tools(mcp_tools, tool_owner, tool_original):
+    groq_tools = list(mcp_tools)
+    for tool_def in LOCAL_TOOL_DEFS:
+        name = tool_def["function"]["name"]
+        tool_owner[name] = LOCAL_SENTINEL
+        tool_original[name] = name
+        groq_tools.append(tool_def)
+    return groq_tools
+
+async def run_cli_loop(groq, messages, groq_tools, tool_owner, tool_original, sessions, app_state: AppState):
+    active_label = app_state.active_label
+    while True:
+        try:
+            user_input = input(f"{active_label}: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            safe_print()
+            break
+
+        if not user_input:
+            continue
+        if user_input.lower() in ("exit", "quit"):
+            break
+
+        messages.append({
+            "role": "user",
+            "content": f"[{active_label}] {user_input}",
+        })
+
+        while True:
+            response = await groq_chat_with_retry(
+                groq,
+                model="openai/gpt-oss-120b",
+                messages=messages,
+                tools=groq_tools or None,
+                tool_choice="auto",
+            )
+
+            choice = response.choices[0]
+            msg = choice.message
+
+            if not msg.tool_calls:
+                reply = msg.content or ""
+                save_commitments(app_state.commitments)
+                safe_print(f"\nAssistant: {reply}\n")
+                messages.append({"role": "assistant", "content": reply})
+                break
+
+            messages.append({
+                "role": "assistant",
+                "content": msg.content or "",
+                "tool_calls": [
+                    {
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {
+                            "name": tc.function.name,
+                            "arguments": tc.function.arguments,
+                        },
+                    }
+                    for tc in msg.tool_calls
+                ],
+            })
+
+            for tc in msg.tool_calls:
+                ns_name = tc.function.name
+                orig_name = tool_original.get(ns_name)
+                srv_name = tool_owner.get(ns_name)
+
+                safe_print(f"  -> Calling tool: {ns_name}")
+
+                if srv_name is None:
+                    result_text = f"Error: unknown tool '{ns_name}'"
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tc.id,
+                        "content": result_text,
+                    })
+                    continue
+
+                try:
+                    args = json.loads(tc.function.arguments) if tc.function.arguments else {}
+                except json.JSONDecodeError:
+                    args = {}
+
+                if srv_name == LOCAL_SENTINEL:
+                    result_text = handle_local_tool(orig_name, args, app_state)
+                    safe_print(f"  -> Local result: {result_text[:200]}")
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tc.id,
+                        "content": result_text,
+                    })
+                    continue
+
+                if is_write_tool(orig_name):
+                    safe_print(f"\n  [!] Write operation: {orig_name}")
+                    safe_print(f"      Args: {json.dumps(args, indent=2)}")
+                    confirm = input("      Confirm? (y/N): ").strip().lower()
+                    if confirm != "y":
+                        result_text = "Execution cancelled by user"
+                        safe_print(f"  -> Cancelled\n")
+                        messages.append({
+                            "role": "tool",
+                            "tool_call_id": tc.id,
+                            "content": result_text,
+                        })
+                        continue
+                    safe_print()
+
+                session = sessions[srv_name]
+                try:
+                    mcp_result = await session.call_tool(orig_name, args)
+                    parts = []
+                    for item in mcp_result.content:
+                        if hasattr(item, "text"):
+                            parts.append(item.text)
+                        else:
+                            parts.append(str(item))
+                    result_text = "\n".join(parts)
+                except Exception as exc:
+                    result_text = f"Error executing tool '{orig_name}': {exc}"
+
+                safe_print(
+                    f"  -> Tool result ({orig_name}):"
+                    f" {result_text[:200]}{'...' if len(result_text) > 200 else ''}"
+                )
+
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc.id,
+                    "content": result_text,
+                })
+
+
 async def main():
     config = load_config()
 
@@ -408,99 +535,43 @@ async def main():
 
     groq = AsyncGroq(api_key=api_key)
 
-    # Build owner lookup: server_name -> owner
-    server_owners: dict[str, str] = {}
+    server_owners = {}
     for name, cfg in config["servers"].items():
         server_owners[name] = cfg.get("owner", "unknown")
 
-    # Calendar ID per person (single Google account, multiple calendars)
-    calendar_map: dict[str, str] = config.get("calendar_map", {})
-    timezone: str = config.get("timezone", "UTC")
+    calendar_map = config.get("calendar_map", {})
+    timezone = config.get("timezone", "UTC")
 
-    # Load persisted commitments
-    commitments: list[Commitment] = load_commitments()
+    app_state = AppState(
+        commitments=load_commitments(),
+        shopping_items=load_shopping_list(),
+    )
 
-    # Load shared shopping list
-    shopping_items: list[ShoppingItem] = load_shopping_list()
-
-    # --- person selection ---
-    active_person = select_person()
-    active_label = PERSON_LABELS.get(active_person, active_person)
-
-    # --- start servers & collect tools ---
-    sessions: dict[str, ClientSession] = {}
-    tool_owner: dict[str, str] = {}       # namespaced -> server name (or LOCAL_SENTINEL)
-    tool_original: dict[str, str] = {}     # namespaced -> original tool name
-    groq_tools = []
-    server_count = 0
+    app_state.active_person = select_person()
+    app_state.active_label = PERSON_LABELS.get(app_state.active_person, app_state.active_person)
 
     async with AsyncExitStack() as stack:
-        for name, cfg in config["servers"].items():
-            owner = server_owners.get(name, "unknown")
-            safe_print(f"Starting MCP server: {name}  (owner: {owner}) ...")
+        sessions, tool_owner, tool_original, mcp_tools, server_count = await setup_servers(config, server_owners, stack)
+        groq_tools = build_tools(mcp_tools, tool_owner, tool_original)
 
-            server_env = cfg.get("env")
-            merged_env = {**os.environ, **server_env} if server_env else None
-
-            server_params = StdioServerParameters(
-                command=cfg["command"],
-                args=cfg.get("args", []),
-                env=merged_env,
-            )
-
-            try:
-                streams = await stack.enter_async_context(stdio_client(server_params))
-                session = await stack.enter_async_context(ClientSession(streams[0], streams[1]))
-                await session.initialize()
-            except Exception as exc:
-                safe_print(f"  -> FAILED to start: {exc}")
-                continue
-
-            sessions[name] = session
-            server_count += 1
-
-            result = await session.list_tools()
-            for tool in result.tools:
-                ns = namespaced_name(name, tool.name)
-                tool_owner[ns] = name
-                tool_original[ns] = tool.name
-
-            groq_tools.extend(mcp_tool_to_openai(name, t, owner) for t in result.tools)
-
-            safe_print(f"  -> {len(result.tools)} tool(s) registered")
-
-        # --- register local tools ---
-        for tool_def in LOCAL_TOOL_DEFS:
-            name = tool_def["function"]["name"]
-            tool_owner[name] = LOCAL_SENTINEL
-            tool_original[name] = name
-            groq_tools.append(tool_def)
-
-        # --- summary ---
-        groq_tool_names = ", ".join(t["function"]["name"] for t in groq_tools)
-        open_count = sum(1 for c in commitments if c.status == "open")
-        unbought_count = sum(1 for i in shopping_items if not i.bought)
+        open_count = sum(1 for c in app_state.commitments if c.status == "open")
+        unbought_count = sum(1 for i in app_state.shopping_items if not i.bought)
         safe_print(f"\nMCP Host ready  |  {server_count} server(s)  |  {len(groq_tools)} tool(s)")
-        safe_print(f"Active: {active_label}  |  Open commitments: {open_count}  |  Shopping: {unbought_count} item(s)")
+        safe_print(f"Active: {app_state.active_label}  |  Open commitments: {open_count}  |  Shopping: {unbought_count} item(s)")
 
-        # --- nudge summary ---
-        nudge_text = generate_nudge_text(commitments, timezone)
+        nudge_text = generate_nudge_text(app_state.commitments, timezone)
         if nudge_text.strip():
             lines = nudge_text.split("\n")
             overdue = sum(1 for l in lines if "OVERDUE:" in l)
             due_today = sum(1 for l in lines if "DUE TODAY:" in l)
             due_soon = sum(1 for l in lines if "DUE SOON:" in l)
             parts = []
-            if overdue:
-                parts.append(f"{overdue} overdue")
-            if due_today:
-                parts.append(f"{due_today} due today")
-            if due_soon:
-                parts.append(f"{due_soon} due soon")
+            if overdue: parts.append(f"{overdue} overdue")
+            if due_today: parts.append(f"{due_today} due today")
+            if due_soon: parts.append(f"{due_soon} due soon")
             safe_print(f"Nudges: {', '.join(parts)}")
         safe_print("Type a message, or 'exit' / 'quit' to stop.\n")
 
-        # --- build calendar map context ---
         cal_hints = []
         for pid, cid in calendar_map.items():
             label = PERSON_LABELS.get(pid, pid)
@@ -508,9 +579,8 @@ async def main():
         cal_context = "; ".join(cal_hints) if cal_hints else ""
         cal_suffix = f"\n\nCalendar mapping: {cal_context}\nWhen creating, editing, or viewing events for a person, use their calendar ID in the calendarId parameter." if cal_context else ""
 
-        # --- system instruction ---
         system_content = (
-            f"You are assisting {active_label}. "
+            f"You are assisting {app_state.active_label}. "
             f"The user's timezone is {timezone}. "
             "When creating or displaying events, always use this timezone "
             "(set the timeZone field in dateTime objects). "
@@ -538,141 +608,13 @@ async def main():
             "Do NOT ask the user to confirm — just silently record it and mention it in your reply."
         )
 
-        # --- CLI loop ---
-        messages: list[dict] = [{"role": "system", "content": system_content}]
+        messages = [{"role": "system", "content": system_content}]
 
-        while True:
-            try:
-                user_input = input(f"{active_label}: ").strip()
-            except (EOFError, KeyboardInterrupt):
-                safe_print()
-                break
+        await run_cli_loop(groq, messages, groq_tools, tool_owner, tool_original, sessions, app_state)
 
-            if not user_input:
-                continue
-            if user_input.lower() in ("exit", "quit"):
-                break
-
-            # Tag the message with who's speaking
-            messages.append({
-                "role": "user",
-                "content": f"[{active_label}] {user_input}",
-            })
-
-            while True:
-                response = await groq_chat_with_retry(
-                    groq,
-                    model="openai/gpt-oss-120b",
-                    messages=messages,
-                    tools=groq_tools or None,
-                    tool_choice="auto",
-                )
-
-                choice = response.choices[0]
-                msg = choice.message
-
-                if not msg.tool_calls:
-                    reply = msg.content or ""
-                    save_commitments(commitments)
-                    safe_print(f"\nAssistant: {reply}\n")
-                    messages.append({"role": "assistant", "content": reply})
-                    break
-
-                # --- assistant message with tool_calls ---
-                messages.append({
-                    "role": "assistant",
-                    "content": msg.content or "",
-                    "tool_calls": [
-                        {
-                            "id": tc.id,
-                            "type": "function",
-                            "function": {
-                                "name": tc.function.name,
-                                "arguments": tc.function.arguments,
-                            },
-                        }
-                        for tc in msg.tool_calls
-                    ],
-                })
-
-                # --- execute each tool call ---
-                for tc in msg.tool_calls:
-                    ns_name = tc.function.name
-                    orig_name = tool_original.get(ns_name)
-                    srv_name = tool_owner.get(ns_name)
-
-                    safe_print(f"  -> Calling tool: {ns_name}")
-
-                    if srv_name is None:
-                        result_text = f"Error: unknown tool '{ns_name}'"
-                        messages.append({
-                            "role": "tool",
-                            "tool_call_id": tc.id,
-                            "content": result_text,
-                        })
-                        continue
-
-                    try:
-                        args = json.loads(tc.function.arguments) if tc.function.arguments else {}
-                    except json.JSONDecodeError:
-                        args = {}
-
-                    # --- local tool handling ---
-                    if srv_name == LOCAL_SENTINEL:
-                        result_text = handle_local_tool(orig_name, args, commitments, shopping_items, active_person, active_label)
-                        safe_print(f"  -> Local result: {result_text[:200]}")
-                        messages.append({
-                            "role": "tool",
-                            "tool_call_id": tc.id,
-                            "content": result_text,
-                        })
-                        continue
-
-                    # --- confirmation gate for MCP write operations ---
-                    if is_write_tool(orig_name):
-                        safe_print(f"\n  [!] Write operation: {orig_name}")
-                        safe_print(f"      Args: {json.dumps(args, indent=2)}")
-                        confirm = input("      Confirm? (y/N): ").strip().lower()
-                        if confirm != "y":
-                            result_text = "Execution cancelled by user"
-                            safe_print(f"  -> Cancelled\n")
-                            messages.append({
-                                "role": "tool",
-                                "tool_call_id": tc.id,
-                                "content": result_text,
-                            })
-                            continue
-                        safe_print()
-
-                    # --- execute the MCP tool ---
-                    session = sessions[srv_name]
-                    try:
-                        mcp_result = await session.call_tool(orig_name, args)
-                        parts = []
-                        for item in mcp_result.content:
-                            if hasattr(item, "text"):
-                                parts.append(item.text)
-                            else:
-                                parts.append(str(item))
-                        result_text = "\n".join(parts)
-                    except Exception as exc:
-                        result_text = f"Error executing tool '{orig_name}': {exc}"
-
-                    safe_print(
-                        f"  -> Tool result ({orig_name}):"
-                        f" {result_text[:200]}{'...' if len(result_text) > 200 else ''}"
-                    )
-
-                    messages.append({
-                        "role": "tool",
-                        "tool_call_id": tc.id,
-                        "content": result_text,
-                    })
-
-    save_commitments(commitments)
-    save_shopping_list(shopping_items)
+    save_commitments(app_state.commitments)
+    save_shopping_list(app_state.shopping_items)
     safe_print("Bye.")
-
 
 if __name__ == "__main__":
     asyncio.run(main())

@@ -1,50 +1,10 @@
 [
   {
-    "person": "person_1",
-    "task": "handle the plumber call",
-    "source_text": "I'll handle the plumber call this week",
-    "deadline": "this week",
-    "status": "open",
-    "created_at": 1783715327.614455
-  },
-  {
-    "person": "person_1",
-    "task": "pickup covered for the kids on Thursday",
-    "source_text": "ok I got Thursday pickup covered for the kids",
-    "deadline": "Thursday",
-    "status": "open",
-    "created_at": 1783715377.9983058
-  },
-  {
-    "person": "person_1",
-    "task": "deal with the insurance thing",
-    "source_text": "I'll deal with the insurance thing by Friday",
-    "deadline": "Friday",
-    "status": "open",
-    "created_at": 1783715437.9352164
-  },
-  {
-    "person": "person_1",
-    "task": "schedule the dentist appointment",
-    "source_text": "I'll schedule the dentist appointment",
-    "deadline": "",
-    "status": "open",
-    "created_at": 1783715472.3318343
-  },
-  {
-    "person": "person_1",
-    "task": "buy milk",
-    "source_text": "I'll buy milk",
-    "deadline": "",
-    "status": "open",
-    "created_at": 1783718851.9248886
-  },
-  {
     "person": "person_2",
-    "task": "buy milk",
-    "source_text": "I'll buy a milk at 6:00 PM Today",
-    "deadline": "today at 6:00 PM",
+    "task": "Buy groceries",
+    "source_text": "",
+    "deadline": "tomorrow",
     "status": "open",
-    "created_at": 1783719957.579746
+    "created_at": 1783773127.420796
   }
 ]

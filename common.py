@@ -12,6 +12,7 @@ from dataclasses import dataclass, field, asdict
 
 PERSON_LABELS = {"person_1": "Divyanshu Garg", "person_2": "dvinix"}
 COMMITMENTS_FILE = "commitments.json"
+SHOPPING_FILE = "shopping_list.json"
 
 
 # ---------------------------------------------------------------------------
@@ -83,8 +84,31 @@ def fuzzy_person_id(raw: str) -> str | None:
 # ---------------------------------------------------------------------------
 
 @dataclass
+class ShoppingItem:
+    name: str
+    added_by: str
+    quantity: str | None = None
+    category: str | None = None
+    bought: bool = False
+    created_at: float = field(default_factory=time.time)
+
+
+def load_shopping_list() -> list[ShoppingItem]:
+    try:
+        with open(SHOPPING_FILE) as f:
+            data = json.load(f)
+            return [ShoppingItem(**c) for c in data]
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
+
+
+def save_shopping_list(items: list[ShoppingItem]) -> None:
+    with open(SHOPPING_FILE, "w") as f:
+        json.dump([asdict(c) for c in items], f, indent=2)
+
+@dataclass
 class AppState:
     commitments: list[Commitment]
-    shopping_items: list  # list[ShoppingItem] — avoid circular import
+    shopping_items: list[ShoppingItem]
     active_person: str = "person_1"
     active_label: str = "Divyanshu Garg"

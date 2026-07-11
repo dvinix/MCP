@@ -1,36 +1,8 @@
 """Shared shopping list with fuzzy dedup for the household MCP assistant."""
 
 import difflib
-import json
-import sys
-import time
-from dataclasses import dataclass, field, asdict
 
-SHOPPING_FILE = "shopping_list.json"
-
-
-@dataclass
-class ShoppingItem:
-    name: str
-    added_by: str
-    quantity: str | None = None
-    category: str | None = None
-    bought: bool = False
-    created_at: float = field(default_factory=time.time)
-
-
-def load_shopping_list() -> list[ShoppingItem]:
-    try:
-        with open(SHOPPING_FILE) as f:
-            data = json.load(f)
-            return [ShoppingItem(**c) for c in data]
-    except (FileNotFoundError, json.JSONDecodeError):
-        return []
-
-
-def save_shopping_list(items: list[ShoppingItem]) -> None:
-    with open(SHOPPING_FILE, "w") as f:
-        json.dump([asdict(c) for c in items], f, indent=2)
+from common import ShoppingItem
 
 
 def fuzzy_dedup(items: list[ShoppingItem], new_name: str, cutoff: float = 0.6) -> ShoppingItem | None:

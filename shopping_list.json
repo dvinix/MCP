@@ -1,10 +1,10 @@
 [
   {
-    "name": "milk",
+    "name": "Milk",
     "added_by": "person_1",
-    "quantity": null,
+    "quantity": "2 liters",
     "category": null,
     "bought": false,
-    "created_at": 1783763561.8618
+    "created_at": 1783773127.4215748
   }
 ]
