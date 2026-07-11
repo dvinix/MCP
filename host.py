@@ -1,4 +1,5 @@
 import asyncio
+import difflib
 import json
 import os
 import sys
@@ -12,6 +13,7 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
 from check_commitments import generate_nudge_text
+from shopping_list import ShoppingItem, load_shopping_list, save_shopping_list, fuzzy_dedup
 
 load_dotenv()
 
@@ -113,6 +115,60 @@ LOCAL_TOOL_DEFS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "add_shopping_item",
+            "description": "Add an item to the shared shopping list. If a similar item already exists, it will be noted rather than duplicated.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Item name (e.g. 'milk', 'paper towels')"},
+                    "quantity": {"type": "string", "description": "Optional quantity (e.g. '2 liters', 'a bunch')"},
+                    "category": {"type": "string", "description": "Optional category (e.g. 'dairy', 'produce', 'household')"},
+                },
+                "required": ["name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_shopping_list",
+            "description": "Show the shared shopping list, optionally filtered by category.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "category": {"type": "string", "description": "Filter by category (optional)"},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "mark_bought",
+            "description": "Mark a shopping list item as bought, by name or 1-based index.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Item name to mark as bought"},
+                    "index": {"type": "integer", "description": "1-based index from list_shopping_list"},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "clear_bought",
+            "description": "Remove all bought items from the shopping list.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+            },
+        },
+    },
 ]
 
 
@@ -137,7 +193,7 @@ def _fuzzy_person_id(raw: str) -> str | None:
                 return pid
     return None
 
-def handle_local_tool(name: str, args: dict, commitments: list[Commitment], active_person: str, active_label: str) -> str:
+def handle_local_tool(name: str, args: dict, commitments: list[Commitment], shopping_items: list[ShoppingItem], active_person: str, active_label: str) -> str:
     """Execute a local tool and return text result."""
     if name == "record_commitment":
         person_arg = args.get("person", active_label)
@@ -176,6 +232,89 @@ def handle_local_tool(name: str, args: dict, commitments: list[Commitment], acti
 
     if name == "get_nudges":
         return generate_nudge_text(commitments)
+
+    # --- shopping list ---
+    if name == "add_shopping_item":
+        item_name = args.get("name", "").strip()
+        if not item_name:
+            return "Error: item name is required."
+        match = fuzzy_dedup(shopping_items, item_name)
+        if match:
+            label = PERSON_LABELS.get(match.added_by, match.added_by)
+            return f"Similar item '{match.name}' already on the list (added by {label}). Consider marking it bought instead."
+        item = ShoppingItem(
+            name=item_name,
+            added_by=active_person,
+            quantity=args.get("quantity"),
+            category=args.get("category"),
+        )
+        shopping_items.append(item)
+        save_shopping_list(shopping_items)
+        parts = [f"Added '{item_name}' to shopping list."]
+        if item.quantity:
+            parts.append(f" ({item.quantity})")
+        if item.category:
+            parts.append(f" [{item.category}]")
+        return " ".join(parts)
+
+    if name == "list_shopping_list":
+        category_filter = args.get("category")
+        unbought = [i for i in shopping_items if not i.bought and (not category_filter or i.category == category_filter)]
+        bought = [i for i in shopping_items if i.bought and (not category_filter or i.category == category_filter)]
+        if not shopping_items:
+            return "Shopping list is empty."
+        lines = []
+        if unbought:
+            lines.append("Still needed:")
+            for idx, item in enumerate(unbought, 1):
+                label = PERSON_LABELS.get(item.added_by, item.added_by)
+                parts = [f"  {idx}. {item.name}"]
+                if item.quantity:
+                    parts.append(f"({item.quantity})")
+                parts.append(f"[by {label}]")
+                if item.category:
+                    parts.append(f"[{item.category}]")
+                lines.append(" ".join(parts))
+        if bought:
+            lines.append("\nBought:")
+            for idx, item in enumerate(bought, 1):
+                label = PERSON_LABELS.get(item.added_by, item.added_by)
+                parts = [f"  {idx}. {item.name}"]
+                if item.quantity:
+                    parts.append(f"({item.quantity})")
+                parts.append(f"[by {label}]")
+                if item.category:
+                    parts.append(f"[{item.category}]")
+                lines.append(" ".join(parts))
+        return "\n".join(lines)
+
+    if name == "mark_bought":
+        item_name = args.get("name")
+        item_index = args.get("index")
+        if item_index is not None:
+            idx = int(item_index) - 1
+            unbought = [i for i in shopping_items if not i.bought]
+            if 0 <= idx < len(unbought):
+                unbought[idx].bought = True
+                save_shopping_list(shopping_items)
+                return f"Marked '{unbought[idx].name}' as bought."
+            return f"Error: index {item_index} out of range."
+        if item_name:
+            names = {i.name.strip().lower(): i for i in shopping_items if not i.bought}
+            matches = difflib.get_close_matches(item_name.strip().lower(), list(names.keys()), n=1, cutoff=0.6)
+            if matches:
+                item = names[matches[0]]
+                item.bought = True
+                save_shopping_list(shopping_items)
+                return f"Marked '{item.name}' as bought."
+            return f"Error: no unbought item matching '{item_name}'."
+        return "Error: provide either name or index."
+
+    if name == "clear_bought":
+        before = sum(1 for i in shopping_items if i.bought)
+        shopping_items[:] = [i for i in shopping_items if not i.bought]
+        save_shopping_list(shopping_items)
+        return f"Removed {before} bought item(s) from the shopping list."
 
     return f"Error: unknown local tool '{name}'"
 
@@ -281,6 +420,9 @@ async def main():
     # Load persisted commitments
     commitments: list[Commitment] = load_commitments()
 
+    # Load shared shopping list
+    shopping_items: list[ShoppingItem] = load_shopping_list()
+
     # --- person selection ---
     active_person = select_person()
     active_label = PERSON_LABELS.get(active_person, active_person)
@@ -337,8 +479,9 @@ async def main():
         # --- summary ---
         groq_tool_names = ", ".join(t["function"]["name"] for t in groq_tools)
         open_count = sum(1 for c in commitments if c.status == "open")
+        unbought_count = sum(1 for i in shopping_items if not i.bought)
         safe_print(f"\nMCP Host ready  |  {server_count} server(s)  |  {len(groq_tools)} tool(s)")
-        safe_print(f"Active: {active_label}  |  Open commitments: {open_count}")
+        safe_print(f"Active: {active_label}  |  Open commitments: {open_count}  |  Shopping: {unbought_count} item(s)")
 
         # --- nudge summary ---
         nudge_text = generate_nudge_text(commitments, timezone)
@@ -476,7 +619,7 @@ async def main():
 
                     # --- local tool handling ---
                     if srv_name == LOCAL_SENTINEL:
-                        result_text = handle_local_tool(orig_name, args, commitments, active_person, active_label)
+                        result_text = handle_local_tool(orig_name, args, commitments, shopping_items, active_person, active_label)
                         safe_print(f"  -> Local result: {result_text[:200]}")
                         messages.append({
                             "role": "tool",
@@ -527,6 +670,7 @@ async def main():
                     })
 
     save_commitments(commitments)
+    save_shopping_list(shopping_items)
     safe_print("Bye.")
 
 
