@@ -14,3 +14,5 @@ wheels/
 
 # Data directory (config references ./data for the filesystem server)
 /data
+credentials.json
+mcp-google-calendar-token.json
